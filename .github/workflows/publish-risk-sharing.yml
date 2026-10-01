@@ -1,0 +1,127 @@
+# Publishes "Global Consumption Risk Sharing" (Kobayashi, Kobori, Kotera,
+# Sawada) from its Overleaf project to risk-sharing/ on this site.
+#
+# Overleaf cannot notify anything when a coauthor edits, so this checks the
+# project on a schedule. The gate is RELEASE.txt in the Overleaf project: the
+# paper is published only when that file has gained a line since the last
+# publish, and only if both documents compile. Every other run does nothing.
+#
+# Needs the repository secret OVERLEAF_TOKEN: an Overleaf Git authentication
+# token (Overleaf -> Account Settings -> Git integration). Without it every run
+# is skipped with a warning rather than failed, so a missing secret does not
+# send an email every hour.
+#
+# The Overleaf commit each publish came from is kept in
+# risk-sharing/RELEASED_FROM; that is how a run knows whether there is
+# anything new. To republish the current release by hand, run this workflow
+# from the Actions tab with "force" ticked.
+
+name: Publish risk-sharing paper
+
+on:
+  schedule:
+    - cron: "23 * * * *"        # hourly; off the hour, when GitHub's queue is shorter
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Republish the latest release even if it is already up"
+        type: boolean
+        default: false
+
+# never two publishes at once
+concurrency:
+  group: publish-risk-sharing
+  cancel-in-progress: false
+
+permissions:
+  contents: write                # commit the PDFs
+  pages: write                   # ask Pages to rebuild
+
+env:
+  OVERLEAF_PROJECT: 677de3e4508622fa2666b830
+  SITE_DIR: risk-sharing
+  DRAFT_TEX: draft/1_draft_risksharing_country.tex
+  APPENDIX_TEX: draft/1_appendix_risksharing_country.tex
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this site
+        uses: actions/checkout@v4
+        with:
+          path: site
+
+      - name: Fetch the Overleaf project and look for a new release
+        id: release
+        env:
+          OVERLEAF_TOKEN: ${{ secrets.OVERLEAF_TOKEN }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OVERLEAF_TOKEN:-}" ]; then
+            echo "::warning::OVERLEAF_TOKEN is not set; skipping. Add it under Settings > Secrets and variables > Actions."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # The token goes in a request header, never in the remote URL, so it
+          # is not written into overleaf/.git/config.
+          auth=$(printf 'git:%s' "$OVERLEAF_TOKEN" | base64 -w0)
+          git -c http.extraHeader="Authorization: Basic $auth" \
+              clone --quiet "https://git.overleaf.com/$OVERLEAF_PROJECT" overleaf
+
+          site_dir="site/$SITE_DIR"
+          bash site/.github/scripts/find-release.sh overleaf "$site_dir/RELEASED_FROM" "$FORCE" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release
+        if: steps.release.outputs.publish == 'true'
+        run: git -C overleaf checkout --quiet "${{ steps.release.outputs.commit }}"
+
+      # Overleaf compiles from the project root, so latexmk runs there too and
+      # writes into build/. The draft's bibliography is bibtex + natbib.
+      - name: Compile the draft and the online appendix
+        if: steps.release.outputs.publish == 'true'
+        uses: xu-cheng/latex-action@v3
+        with:
+          working_directory: overleaf
+          root_file: |
+            ${{ env.DRAFT_TEX }}
+            ${{ env.APPENDIX_TEX }}
+          args: -pdf -file-line-error -halt-on-error -interaction=nonstopmode -outdir=build
+
+      - name: Publish
+        if: steps.release.outputs.publish == 'true'
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+          NOTE: ${{ steps.release.outputs.note }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          draft_pdf="overleaf/build/$(basename "$DRAFT_TEX" .tex).pdf"
+          appendix_pdf="overleaf/build/$(basename "$APPENDIX_TEX" .tex).pdf"
+          test -s "$draft_pdf" && test -s "$appendix_pdf"
+
+          mkdir -p "site/$SITE_DIR"
+          cp "$draft_pdf"    "site/$SITE_DIR/draft.pdf"
+          cp "$appendix_pdf" "site/$SITE_DIR/online_appendix.pdf"
+          echo "$COMMIT" > "site/$SITE_DIR/RELEASED_FROM"
+
+          cd site
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$SITE_DIR"
+          git commit --quiet -m "Publish risk-sharing draft and online appendix: $NOTE" \
+                     -m "From Overleaf commit $COMMIT."
+          # the rivers-conflict paper is still published to this repo by hand
+          git pull --quiet --rebase origin main
+          git push --quiet origin HEAD:main
+
+          # Pushes made with the workflow token may not start a Pages build on
+          # their own; ask for one explicitly. A failure here is not fatal --
+          # the PDFs are committed and the next build picks them up.
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null \
+            || echo "::warning::Could not request a Pages build; the PDFs are committed and will appear on the next build."
+
+          echo "### Published: $NOTE" >> "$GITHUB_STEP_SUMMARY"
+          echo "From Overleaf commit \`$COMMIT\`." >> "$GITHUB_STEP_SUMMARY"
